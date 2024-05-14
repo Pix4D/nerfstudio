@@ -18,16 +18,20 @@
 import sys
 import zipfile
 from dataclasses import dataclass
+import json
 from pathlib import Path
 from typing import Optional, Union
 
 import numpy as np
+import pyopf.io
+import pyopf.resolve
 import tyro
 from typing_extensions import Annotated
 
 from nerfstudio.process_data import (
     metashape_utils,
     odm_utils,
+    opf_utils,
     polycam_utils,
     process_data_utils,
     realitycapture_utils,
@@ -500,6 +504,64 @@ class ProcessODM(BaseConverterToNerfstudioDataset):
             CONSOLE.print(summary, justify="center")
         CONSOLE.rule()
 
+@dataclass
+class ProcessOPF(BaseConverterToNerfstudioDataset):
+    """Process calibrated OPF project into a nerfstudio dataset.
+
+    This script does the following:
+
+    1. Scales images to a specified size.
+    2. Converts OPF poses into the nerfstudio format.
+    """
+
+    num_downscales: int = 3
+    """Number of times to downscale the images. Downscales by 2 each time. For example a value of 3
+        will downscale the images by 2x, 4x, and 8x."""
+    max_dataset_size: int = 600
+    """Max number of images to train on. If the dataset has more, images will be sampled approximately evenly. If -1,
+    use all images."""
+
+    def main(self) -> None:
+        """Process calibrated OPF project into a nerfstudio dataset."""
+        summary_log = []
+        if self.data.is_dir():
+            project_path = self.data / "project.opf"
+            summary_log.append(f"Input data is a directory: using {project_path} as the project file.")
+        else:
+            project_path = self.data
+
+        if not project_path.exists():
+            raise ValueError(f"Could not find project file: {project_path}")
+
+        project = pyopf.io.load(str(project_path))
+        project = pyopf.resolve.resolve(project)
+
+        calibrated_cameras = project.calibration.calibrated_cameras
+        calibrated_sensors = calibrated_cameras.sensors
+
+        sensor_id_to_intrinsics = {}
+        for sensor in calibrated_sensors:
+            if sensor.internals.type == "fisheye":
+                raise RuntimeError("OPF projects with fisheye cameras are not supported")
+
+            input_sensor = next((input_sensor for input_sensor in project.input_cameras.sensors if input_sensor.id == sensor.id), None)
+            sensor_id_to_intrinsics[sensor.id] = opf_utils.extract_intrinsics(sensor, image_size_px=input_sensor.image_size_px)
+
+        camera_datas = opf_utils.filter_cameras(project.camera_list)
+
+        transforms_out = opf_utils.make_transforms(camera_datas, calibrated_cameras, sensor_id_to_intrinsics, project_path.parent)
+
+        camera_paths = [Path(frame["file_path"]) for frame in transforms_out["frames"]]
+        process_data_utils.copy_images_list(camera_paths, self.image_dir, 0, image_prefix="")
+
+        with open(self.output_dir / "transforms.json", "w") as file:
+            json.dump(transforms_out, file, indent=4)
+
+        CONSOLE.rule("[bold green]:tada: :tada: :tada: All DONE :tada: :tada: :tada:")
+
+        for summary in summary_log:
+            CONSOLE.print(summary, justify="center")
+        CONSOLE.rule()
 
 @dataclass
 class NotInstalled:
@@ -515,6 +577,7 @@ Commands = Union[
     Annotated[ProcessRealityCapture, tyro.conf.subcommand(name="realitycapture")],
     Annotated[ProcessRecord3D, tyro.conf.subcommand(name="record3d")],
     Annotated[ProcessODM, tyro.conf.subcommand(name="odm")],
+    Annotated[ProcessOPF, tyro.conf.subcommand(name="opf")],
 ]
 
 # Add aria subcommand if projectaria_tools is installed.
@@ -524,7 +587,8 @@ except ImportError:
     projectaria_tools = None
 
 if projectaria_tools is not None:
-    from nerfstudio.scripts.datasets.process_project_aria import ProcessProjectAria
+    from nerfstudio.scripts.datasets.process_project_aria import \
+        ProcessProjectAria
 
     # Note that Union[A, Union[B, C]] == Union[A, B, C].
     Commands = Union[Commands, Annotated[ProcessProjectAria, tyro.conf.subcommand(name="aria")]]
